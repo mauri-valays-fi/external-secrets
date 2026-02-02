@@ -8,7 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"strings"
 
 	"github.com/SSHcom/privx-sdk-go/api/vault"
 	privxapi "github.com/SSHcom/privx-sdk-go/restapi"
@@ -36,15 +36,10 @@ func (c *SecretsClient) GetSecret(ctx context.Context, ref esv1.ExternalSecretDa
 
 	secret, error := c.vault.Secret(ref.Key)
 	if error != nil {
-		log.Println("Error", error, "Secret", secret)
 		return nil, error
 	} else {
-		log.Println("Received secret", secret)
-		// The secret should be a JSON value
-		// Do we want to validate ?
 		data := secret.Data
 		if !json.Valid(data) {
-			log.Println("invalid JSON")
 			return nil, ErrInvalidJson
 		}
 		return data, nil
@@ -97,7 +92,16 @@ func (c *SecretsClient) SecretExists(ctx context.Context, remoteRef esv1.PushSec
 // and is able to retrieve secrets from the provider.
 // If the validation result is unknown it will be ignored.
 func (c *SecretsClient) Validate() (esv1.ValidationResult, error) {
-	return esv1.ValidationResultError, ErrNotImplemented
+
+	_, err := c.GetSecret(context.TODO(), esv1.ExternalSecretDataRemoteRef{Key: "2F0vZqCe0Z3XU5"})
+
+	// PrivX loses the HTTP code so we need to test the error message
+	if strings.Contains(strings.ToLower(err.Error()), "secret not found") {
+		// We requested a non-existing secret and this is the proper response from PrivX -- all ok.
+		return esv1.ValidationResultReady, nil
+	}
+
+	return esv1.ValidationResultError, err
 }
 
 // GetSecretMap returns multiple k/v pairs from the provider

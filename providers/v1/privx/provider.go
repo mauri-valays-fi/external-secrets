@@ -1,5 +1,5 @@
 /*
-Implement the ESO Provider
+Implement the ESO Provider.
 */
 package privx
 
@@ -11,8 +11,11 @@ import (
 	"github.com/SSHcom/privx-sdk-go/api/vault"
 	"github.com/SSHcom/privx-sdk-go/oauth"
 	privxapi "github.com/SSHcom/privx-sdk-go/restapi"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
+	v1 "github.com/external-secrets/external-secrets/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -31,50 +34,141 @@ func (e ErrNoStoreAuth) Error() string {
 	return fmt.Sprintf("no PrivX authorisation from SecretStore definition (missing %s)", e.Field)
 }
 
-// Check during compile that we implement the interface
+// Check during compile that we implement the interface.
 var _ esv1.Provider = (*Provider)(nil)
 
 // Provider implements the ESO Provider interface for PrivX.
 type Provider struct {
 }
 
-// authorize fetches the authorisation from config files or environment variables.
-func authorize() privxapi.Authorizer {
+// readSecretValue gets a Kubernetes Secret as a string.
+func readSecretValue(
+	ctx context.Context,
+	client kclient.Client,
+	namespace string,
+	ref v1.SecretKeySelector,
+) (string, error) {
+
+	var secret corev1.Secret
+	if err := client.Get(ctx, types.NamespacedName{
+		Namespace: namespace,
+		Name:      ref.Name,
+	}, &secret); err != nil {
+		return "", err
+	}
+
+	b, ok := secret.Data[ref.Key]
+	if !ok {
+		return "", fmt.Errorf("secret %s/%s missing key %q", namespace, ref.Name, ref.Key)
+	}
+
+	// logger := log.FromContext(ctx)
+	// logger.Info("Secret value for debugging", "key", ref.Key, "value", string(b))
+
+	return string(b), nil
+}
+
+// privxAuth creates authentication from information in the Store specification.
+func privxAuth(
+	ctx context.Context,
+	kube kclient.Client,
+	namespace string,
+	privxSpec *esv1.PrivxProvider,
+) (privxapi.Authorizer, error) {
+
 	auth := privxapi.New(
-		privxapi.UseConfigFile("config.toml"),
-		privxapi.UseEnvironment(),
+		privxapi.BaseURL(privxSpec.Host),
 	)
+
+	// apiClientIdRef:
+	// privx_api_client_id
+	clientID, err := readSecretValue(
+		ctx,
+		kube,
+		namespace,
+		privxSpec.Auth.OAuth.ApiClientIDRef,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// apiClientSecretRef:
+	// privx_api_client_secret
+	clientSecret, err := readSecretValue(
+		ctx,
+		kube,
+		namespace,
+		privxSpec.Auth.OAuth.ApiClientSecretRef,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// clientIdRef:
+	// privx_api_oauth_client_id
+	oAuthAccess, err := readSecretValue(
+		ctx,
+		kube,
+		namespace,
+		privxSpec.Auth.OAuth.ClientIDRef,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// clientSecretRef:
+	// privx_api_oauth_client_secret
+	oAuthSecret, err := readSecretValue(
+		ctx,
+		kube,
+		namespace,
+		privxSpec.Auth.OAuth.ClientSecretRef,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	return oauth.With(
 		auth,
-		// 1. Use config file option to configure authorizer
-		oauth.UseConfigFile("config.toml"),
-		// 2. Use environment variables option to configure authorizer
-		oauth.UseEnvironment(),
-	)
+		oauth.Access(clientID),
+		oauth.Secret(clientSecret),
+		oauth.Digest(oAuthAccess, oAuthSecret),
+	), nil
+
 }
 
-// privx_api creates a working PrivX API connection
-func privx_api() privxapi.Connector {
-	return privxapi.New(
-		privxapi.Verbose(),
-		privxapi.Auth(authorize()),
-		privxapi.UseConfigFile("config.toml"),
-		privxapi.UseEnvironment(),
-	)
-}
+// privxAPI creates a working PrivX API connection from information in the Store specification.
+func privxAPI(
+	ctx context.Context,
+	kube kclient.Client,
+	namespace string,
+	privxSpec *esv1.PrivxProvider,
+) (privxapi.Connector, error) {
 
-// NewClient implements the Client interface.
-func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube kclient.Client, namespace string) (esv1.SecretsClient, error) {
-
-	// Get details delivered in Kubernetes info
-	info := store.GetSpec().Provider.PrivX
-	if info == nil {
-		return nil, ErrNoStoreAuth{Field: "spec.provider.privx"}
+	auth, err := privxAuth(ctx, kube, namespace, privxSpec)
+	if err != nil {
+		return nil, err
 	}
 
-	// TODO: this should use auth from the Kubernetes call ...
-	conn := privx_api()
+	return privxapi.New(
+		privxapi.BaseURL(privxSpec.Host),
+		privxapi.Auth(auth),
+	), nil
+}
+
+// NewClient returns a new PrivX Client.
+func (p *Provider) NewClient(
+	ctx context.Context,
+	store esv1.GenericStore,
+	kube kclient.Client,
+	namespace string,
+) (esv1.SecretsClient, error) {
+
+	conn, err := privxAPI(ctx, kube, namespace, store.GetSpec().Provider.PrivX)
+	if err != nil {
+		return nil, err
+	}
+
 	client := SecretsClient{
 		conn:      conn,
 		vault:     vault.New(conn),
@@ -86,7 +180,23 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 }
 
 func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, error) {
-	return nil, ErrNotImplemented
+
+	if store.GetSpec().Provider == nil {
+		return nil, ErrNoStoreAuth{Field: "spec.provider"}
+	}
+	provider := store.GetSpec().Provider
+	if provider.PrivX == nil {
+		return nil, ErrNoStoreAuth{Field: "spec.provider.privx"}
+	}
+	privx := provider.PrivX
+	if privx.Auth == nil {
+		return nil, ErrNoStoreAuth{Field: "spec.provider.privx.auth"}
+	}
+	if privx.Host == "" {
+		return nil, ErrNoStoreAuth{Field: "spec.provider.privx.host"}
+	}
+
+	return nil, nil
 }
 
 func (p *Provider) Capabilities() esv1.SecretStoreCapabilities {

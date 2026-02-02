@@ -25,16 +25,22 @@ type PrivxProvider struct {
 	// Auth configures how secret-manager authenticates with PrivX server.
 	Auth *PrivXAuth `json:"auth,omitempty"`
 
-	// Server is the connection address for the server, e.g: "https://privx.example.com:8200".
+	// Server is the connection address for the server, e.g: "https://privx.example.com:8080".
 	Host string `json:"host"`
 }
 
+// PrivXAuth contains the information needed for authentication towards PrivX.
+//
+// Use only one of the authentication options.
 type PrivXAuth struct {
-	Namespace *string     `json:"namespace,omitempty"`
-	OAuth     *PrivXOAuth `json:"oauth,omitempty"`
+	// OAuth is the OAuth2 authentication option
+	OAuth *PrivXOAuth `json:"oauth,omitempty"`
 }
 
+// PrivXOAuth contains the information needed for authentication with OAuth2.
 type PrivXOAuth struct {
-	ClientIdRef     esmeta.SecretKeySelector `json:"clientIdRef"`
-	ClientSecretRef esmeta.SecretKeySelector `json:"clientSecretRef"`
+	ClientIDRef        esmeta.SecretKeySelector `json:"clientIDRef"`
+	ClientSecretRef    esmeta.SecretKeySelector `json:"clientSecretRef"`
+	ApiClientIDRef     esmeta.SecretKeySelector `json:"apiClientIDRef"`
+	ApiClientSecretRef esmeta.SecretKeySelector `json:"apiClientSecretRef"`
 }
