@@ -164,17 +164,20 @@ func (p *Provider) NewClient(
 	namespace string,
 ) (esv1.SecretsClient, error) {
 
-	conn, err := privxAPI(ctx, kube, namespace, store.GetSpec().Provider.PrivX)
+	config := store.GetSpec().Provider.PrivX
+	conn, err := privxAPI(ctx, kube, namespace, config)
 	if err != nil {
 		return nil, err
 	}
 
 	client := SecretsClient{
-		conn:      conn,
-		vault:     vault.New(conn),
-		store:     store,
-		kube:      kube,
-		namespace: namespace,
+		conn:              conn,
+		vault:             vault.New(conn),
+		store:             store,
+		kube:              kube,
+		namespace:         namespace,
+		defaultReadRoles:  config.DefaultReadRoles,
+		defaultWriteRoles: config.DefaultWriteRoles,
 	}
 	return &client, nil
 }
@@ -200,7 +203,7 @@ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, e
 }
 
 func (p *Provider) Capabilities() esv1.SecretStoreCapabilities {
-	return esv1.SecretStoreReadOnly
+	return esv1.SecretStoreReadWrite
 }
 
 // NewProvider creates a new Provider instance.

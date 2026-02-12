@@ -27,6 +27,12 @@ type PrivxProvider struct {
 
 	// Server is the connection address for the server, e.g: "https://privx.example.com:8080".
 	Host string `json:"host"`
+
+	// DefaultReadRoles are used upon pushing new secrets to PrivX to set read access.
+	DefaultReadRoles []string `json:"defaultReadRoles"`
+
+	// DefaultWriteRoles are used upon pushing new secrets to PrivX to set write access.
+	DefaultWriteRoles []string `json:"defaultWriteRoles"`
 }
 
 // PrivXAuth contains the information needed for authentication towards PrivX.

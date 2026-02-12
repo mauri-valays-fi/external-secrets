@@ -33,6 +33,10 @@ type SecretsClient struct {
 	store     esv1.GenericStore
 	kube      kclient.Client
 	namespace string
+
+	// PrivX needs roles when creating a new secret.
+	defaultReadRoles  []string
+	defaultWriteRoles []string
 }
 
 // GetSecret returns a single secret from the provider.
@@ -54,6 +58,8 @@ func (c *SecretsClient) GetSecret(ctx context.Context, ref esv1.ExternalSecretDa
 }
 
 // PushSecret will write a single secret into PrivX.
+//
+// Access for the new secret in PrivX is defined by variables default*Roles set for the store.
 func (c *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1.PushSecretData) error {
 	remoteKey := data.GetRemoteKey()
 	name := remoteKey
@@ -70,7 +76,7 @@ func (c *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, d
 		return fmt.Errorf("missing secret data for key %q", secretKey)
 	}
 
-	return c.vault.CreateSecret(name, []string{}, []string{}, secretValue)
+	return c.vault.CreateSecret(name, c.defaultReadRoles, c.defaultWriteRoles, secretValue)
 }
 
 // DeleteSecret will delete the secret from PrivX.
