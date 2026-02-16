@@ -8,9 +8,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/SSHcom/privx-sdk-go/api/vault"
-	"github.com/SSHcom/privx-sdk-go/oauth"
-	privxapi "github.com/SSHcom/privx-sdk-go/restapi"
+	"github.com/SSHcom/privx-sdk-go/v2/api/vault"
+	"github.com/SSHcom/privx-sdk-go/v2/oauth"
+	privxapi "github.com/SSHcom/privx-sdk-go/v2/restapi"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 

@@ -11,17 +11,25 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
-	"github.com/SSHcom/privx-sdk-go/api/vault"
-	privxapi "github.com/SSHcom/privx-sdk-go/restapi"
+	"github.com/SSHcom/privx-sdk-go/v2/api/filters"
+	"github.com/SSHcom/privx-sdk-go/v2/api/rolestore"
+	"github.com/SSHcom/privx-sdk-go/v2/api/vault"
+	privxapi "github.com/SSHcom/privx-sdk-go/v2/restapi"
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
 	corev1 "k8s.io/api/core/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-var ErrNoName = errors.New("No name provided for secret")
-var ErrUnsupportedDecodingStrategy = errors.New("unsupported decoding strategy")
+var (
+	ErrNoName                      = errors.New("No name provided for secret")
+	ErrUnsupportedDecodingStrategy = errors.New("unsupported decoding strategy")
+	ErrSecretDataMissing           = errors.New("secret data missing")
+	ErrPropertyNotFound            = errors.New("property not found in secret")
+)
 
 // Check during compile that we implement the interface
 var _ esv1.SecretsClient = (*SecretsClient)(nil)
@@ -41,20 +49,42 @@ type SecretsClient struct {
 
 // GetSecret returns a single secret from the provider.
 func (c *SecretsClient) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
-
-	secret, error := c.vault.Secret(ref.Key)
-	if error != nil {
-		return nil, error
-	} else {
-		data, err := decode(secret.Data, ref.DecodingStrategy)
-		if err != nil {
-			return nil, err
-		}
-		if !json.Valid(data) {
-			return nil, ErrInvalidJson
-		}
-		return data, nil
+	secret, err := c.vault.GetSecret(ref.Key)
+	if err != nil {
+		return nil, err
 	}
+	if secret.Data == nil {
+		return nil, fmt.Errorf("%w: %s", ErrSecretDataMissing, ref.Key)
+	}
+
+	// If no property requested, return whole JSON object
+	if ref.Property == "" {
+		return json.Marshal(*secret.Data)
+	}
+
+	v, ok := (*secret.Data)[ref.Property]
+	if !ok || v == nil {
+		return nil, fmt.Errorf("%w: %s/%s", ErrPropertyNotFound, ref.Key, ref.Property)
+	}
+
+	// Convert the selected value to []byte
+	b, err := anyToBytes(v)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// packRoles forms RoleHandles from a list of role ID
+//
+// The PrivX API will ignore the name field.
+// See https://privx.docs.ssh.com/v42/api/vault/create-a-secret
+func packRoles(roleIDs []string) []rolestore.RoleHandle {
+	result := []rolestore.RoleHandle{}
+	for _, id := range roleIDs {
+		result = append(result, rolestore.RoleHandle{ID: id, Name: ""})
+	}
+	return result
 }
 
 // PushSecret will write a single secret into PrivX.
@@ -71,12 +101,28 @@ func (c *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, d
 	}
 
 	secretKey := data.GetSecretKey()
-	secretValue, ok := secret.Data[secretKey]
-	if !ok {
-		return fmt.Errorf("missing secret data for key %q", secretKey)
-	}
+	secretValue := secret.Data[secretKey]
+	m := &map[string]interface{}{secretKey: secretValue}
 
-	return c.vault.CreateSecret(name, c.defaultReadRoles, c.defaultWriteRoles, secretValue)
+	request := vault.SecretRequest{
+		Name:       name,
+		ReadRoles:  packRoles(c.defaultReadRoles),
+		WriteRoles: packRoles(c.defaultWriteRoles),
+		Data:       m,
+	}
+	_, err := c.vault.CreateSecret(&request)
+
+	logger := log.FromContext(ctx)
+	logger.Error(
+		err,
+		"privx error",
+		"errorType", fmt.Sprintf("%T", err),
+		"remoteKey", name,
+		"readRoles", c.defaultReadRoles,
+		"writeRoles", c.defaultWriteRoles,
+	)
+
+	return err
 }
 
 // DeleteSecret will delete the secret from PrivX.
@@ -123,67 +169,33 @@ func (c *SecretsClient) Validate() (esv1.ValidationResult, error) {
 	return esv1.ValidationResultError, err
 }
 
-// GetSecretMap returns multiple k/v pairs from PrivX.
+// GetSecretMap returns multiple key/value pairs from a PrivX secret.
+//
+// If ref.Property is empty, all top-level keys are returned.
+// If ref.Property refers to a nested JSON object, its fields are returned.
+// Otherwise, a single key/value pair is returned containing the selected property.
 func (c *SecretsClient) GetSecretMap(
 	ctx context.Context,
 	ref esv1.ExternalSecretDataRemoteRef,
 ) (map[string][]byte, error) {
 
-	// 1) Hae sama payload kuin GetSecret tekee
-	secret, err := c.vault.Secret(ref.Key)
+	secret, err := c.vault.GetSecret(ref.Key)
 	if err != nil {
 		return nil, err
 	}
 
-	data := secret.Data
-	if !json.Valid(data) {
-		return nil, ErrInvalidJson
+	if secret.Data == nil {
+		return nil, ErrSecretDataMissing
 	}
 
-	// Helper: tee RawMessage -> []byte sopivassa muodossa
-	rawToBytes := func(raw json.RawMessage) ([]byte, error) {
-		// Jos se on JSON-string, palautetaan unquote'tattu merkkijono (tyypillinen ESO-odotus)
-		var s string
-		if err := json.Unmarshal(raw, &s); err == nil {
-			return []byte(s), nil
-		}
+	data := *secret.Data
 
-		// Muut scalarit (numero/bool/null) voidaan palauttaa "tekstinä"
-		var v any
-		if err := json.Unmarshal(raw, &v); err == nil {
-			switch t := v.(type) {
-			case nil:
-				return []byte("null"), nil
-			case bool:
-				if t {
-					return []byte("true"), nil
-				}
-				return []byte("false"), nil
-			case float64:
-				// JSON-numero -> palautetaan alkuperäinen JSON bytes (säilyttää muodot esim 1 vs 1.0 huonosti),
-				// mutta tämä on yleensä ok. Vaihtoehto: fmt.Sprintf(...).
-				return []byte(raw), nil
-			default:
-				// array/object jne -> palautetaan JSON bytes sellaisenaan
-				return []byte(raw), nil
-			}
-		}
-
-		// fallback: sellaisenaan
-		return []byte(raw), nil
-	}
-
-	// 2) Parse top-level objektiksi
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return nil, ErrInvalidJson
-	}
-
-	// 3) Jos property on tyhjä: palauta kaikki top-level avaimet
+	// 1) No property specified: return all top-level keys
 	if ref.Property == "" {
-		out := make(map[string][]byte, len(obj))
-		for k, raw := range obj {
-			b, err := rawToBytes(raw)
+		out := make(map[string][]byte, len(data))
+
+		for k, v := range data {
+			b, err := anyToBytes(v)
 			if err != nil {
 				return nil, err
 			}
@@ -192,18 +204,17 @@ func (c *SecretsClient) GetSecretMap(
 		return out, nil
 	}
 
-	// 4) Property annettu: poimi se
-	raw, ok := obj[ref.Property]
-	if !ok {
-		return nil, errors.New("property not found in secret JSON: " + ref.Property)
+	// 2) Property specified: extract it
+	v, ok := data[ref.Property]
+	if !ok || v == nil {
+		return nil, ErrPropertyNotFound
 	}
 
-	// Jos property on objekti, palauta sen avaimet map:na
-	var nested map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &nested); err == nil {
+	// If property is a nested object, return its fields
+	if nested, ok := v.(map[string]interface{}); ok {
 		out := make(map[string][]byte, len(nested))
-		for k, v := range nested {
-			b, err := rawToBytes(v)
+		for k, nv := range nested {
+			b, err := anyToBytes(nv)
 			if err != nil {
 				return nil, err
 			}
@@ -212,8 +223,8 @@ func (c *SecretsClient) GetSecretMap(
 		return out, nil
 	}
 
-	// Muuten property on yksittäinen arvo: palautetaan yhden avaimen map
-	b, err := rawToBytes(raw)
+	// Otherwise return a single key/value pair
+	b, err := anyToBytes(v)
 	if err != nil {
 		return nil, err
 	}
@@ -223,17 +234,12 @@ func (c *SecretsClient) GetSecretMap(
 	}, nil
 }
 
-// GetAllSecrets returns multiple secrets and their JSON values from PrivX
+// GetAllSecrets returns multiple secrets and their JSON values from PrivX.
 //
-// I assume that means key is the secret name and value is the JSON contained.
-// Because otherwise, several secrets can have same key in the JSON and returning all the k/v pairs from inside the
-// list of secrets would create collisions.
+// The returned map key is the secret name and the value is the full JSON document
+// for that secret (the whole secret.Data marshaled as JSON). This avoids key
+// collisions between secrets that may contain identical JSON keys internally.
 func (c *SecretsClient) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind) (map[string][]byte, error) {
-
-	// Kubernetes gives a regexp. PrivX expects a partial string for the search expression.
-	// We have no way of converting the Kubernetes expression into a parameter for PrivX search.
-	// Therefore the only robust way to seek is to retrieve every secret name and compare it with regexp.
-
 	results := make(map[string][]byte)
 
 	if ref.Path != nil {
@@ -260,32 +266,43 @@ func (c *SecretsClient) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecr
 	// Loop through all secrets 100 at a time
 	const limit = 100
 	for offset := 0; ; offset += limit {
-		secrets, err := c.vault.Secrets(offset, limit)
+		secrets, err := c.vault.GetSecrets(filters.Limit(limit), filters.Offset(offset))
 		if err != nil {
 			return results, err
 		}
 
-		if len(secrets) == 0 {
+		if secrets.Count == 0 {
 			break
 		}
 
-		for _, secret := range secrets {
-			if !nameRegexp.MatchString(secret.ID) {
+		for _, secret := range secrets.Items {
+			if !nameRegexp.MatchString(secret.Name) {
 				continue
 			}
 
-			secretDetails, err := c.vault.Secret(secret.ID)
+			secretDetails, err := c.vault.GetSecret(secret.Name)
 			if err != nil {
 				return results, err
 			}
 
-			results[secret.ID] = secretDetails.Data
+			if secretDetails.Data == nil {
+				return results, ErrSecretDataMissing
+			}
+
+			// Marshal the full JSON object (top-level map) as the secret value
+			b, err := json.Marshal(*secretDetails.Data)
+			if err != nil {
+				return results, err
+			}
+
+			results[secret.Name] = b
 		}
 
-		if len(secrets) < limit {
+		if secrets.Count < limit {
 			break
 		}
 	}
+
 	return results, nil
 }
 
@@ -335,6 +352,42 @@ func decode(value []byte, strategy esv1.ExternalSecretDecodingStrategy) ([]byte,
 	default:
 		return nil, fmt.Errorf("%w: %v", ErrUnsupportedDecodingStrategy, strategy)
 	}
+}
+
+// anyToBytes converts a JSON-unmarshaled value (interface{}) to []byte.
+func anyToBytes(v any) ([]byte, error) {
+	switch t := v.(type) {
+	case []byte:
+		// Already bytes
+		return t, nil
+
+	case string:
+		// Common case for JSON: strings become string (not []byte).
+		return []byte(t), nil
+
+	case bool:
+		return []byte(strconv.FormatBool(t)), nil
+
+	case float64:
+		// JSON numbers become float64 when unmarshaling into interface{}
+		return []byte(strconv.FormatFloat(t, 'f', -1, 64)), nil
+
+	case json.Number:
+		return []byte(t.String()), nil
+
+	default:
+		// For objects/arrays (map/slice) and other types: return JSON encoding
+		return json.Marshal(t)
+	}
+}
+
+// rawToBytes converts a json.RawMessage into a byte slice suitable for secret return values.
+func rawToBytes(raw json.RawMessage) ([]byte, error) {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, err
+	}
+	return anyToBytes(v)
 }
 
 // // convertValue converts a secret value based on the conversion strategy.
