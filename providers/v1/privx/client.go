@@ -112,16 +112,17 @@ func (c *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, d
 	}
 	_, err := c.vault.CreateSecret(&request)
 
-	logger := log.FromContext(ctx)
-	logger.Error(
-		err,
-		"privx error",
-		"errorType", fmt.Sprintf("%T", err),
-		"remoteKey", name,
-		"readRoles", c.defaultReadRoles,
-		"writeRoles", c.defaultWriteRoles,
-	)
-
+	if err != nil {
+		logger := log.FromContext(ctx)
+		logger.Error(
+			err,
+			"privx error",
+			"errorType", fmt.Sprintf("%T", err),
+			"remoteKey", name,
+			"readRoles", c.defaultReadRoles,
+			"writeRoles", c.defaultWriteRoles,
+		)
+	}
 	return err
 }
 
