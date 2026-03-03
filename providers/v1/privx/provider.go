@@ -158,25 +158,40 @@ func privxAuth(
 
 	var token string
 	var err error
-	if privxSpec.Auth != nil && privxSpec.Auth.JWTPublicKey != "" {
+	if privxSpec.Auth != nil &&
+		privxSpec.Auth.JWTAuth != nil {
 		// JWT public key given, use it to sign a JWT
 		// This is needed for PrivX 43 and earlier.
+		token, err = createSignedJWT(
+			ctx,
+			kube,
+			namespace,
+			privxSpec.Auth.JWTAuth.PublicKeyRef,
+			privxSpec.Auth.JWTAuth.Iss,
+			privxSpec.Auth.JWTAuth.Sub,
+			privxSpec.Host,
+			15*time.Minute,
+			map[string]any{},
+			// PrivX seems to expect a domain claim
+			// map[string]any{"domain": "privx-service"},
+		)
 	} else {
 
 		// No OAuth tokens, no public key, use JWT with Kubernetes signature
 		// PrivX 44 or later
 		// "may not specify a duration less than 10 minutes"
 		token, err = getAudienceJWTFromPod(ctx, privxSpec.Host, 15*time.Minute)
-		if err != nil {
-			return nil, err
-		}
+
 	}
-	logger := log.FromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	decoded, err := decodeJWT(token)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidJWT, err)
 	}
 
+	logger := log.FromContext(ctx)
 	logger.Info("JWT payload", "claims", decoded)
 
 	return oauth.WithToken("Bearer " + token), nil

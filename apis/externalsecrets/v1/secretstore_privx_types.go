@@ -22,11 +22,12 @@ import (
 
 // PrivxProvider configures a store to sync secrets using PrivX backend.
 type PrivxProvider struct {
-	// Auth configures how secret-manager authenticates with PrivX server.
-	Auth *PrivXAuth `json:"auth,omitempty"`
 
 	// Server is the connection address for the server, e.g: "https://privx.example.com:8080".
 	Host string `json:"host"`
+
+	// Auth configures how secret-manager authenticates with PrivX server.
+	Auth *PrivXAuth `json:"auth,omitempty"`
 
 	// DefaultReadRoles are used upon pushing new secrets to PrivX to set read access.
 	DefaultReadRoles []string `json:"defaultReadRoles"`
@@ -41,6 +42,9 @@ type PrivxProvider struct {
 type PrivXAuth struct {
 	// OAuth is the OAuth2 authentication option
 	OAuth *PrivXOAuth `json:"oauth,omitempty"`
+
+	// JWTPublicKey contains a public key in PEM format for signing the JWT
+	JWTAuth *PrivxJWTAuth `json:"jwtAuth,omitempty"`
 }
 
 // PrivXOAuth contains the information needed for authentication with OAuth2.
@@ -49,4 +53,15 @@ type PrivXOAuth struct {
 	ClientSecretRef    esmeta.SecretKeySelector `json:"clientSecretRef"`
 	ApiClientIDRef     esmeta.SecretKeySelector `json:"apiClientIDRef"`
 	ApiClientSecretRef esmeta.SecretKeySelector `json:"apiClientSecretRef"`
+}
+
+// PrivxJWTAuth contains the information needed for authentication with explicit public key.
+type PrivxJWTAuth struct {
+	// PublicKeyRef contains a public key in PEM format for signing the JWT
+	PublicKeyRef esmeta.SecretKeySelector `json:"publicKeyRef"`
+
+	Iss string `json:"iss"`
+
+	// Sub must match a user name in PrivX
+	Sub string `json:"sub"`
 }
