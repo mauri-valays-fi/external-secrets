@@ -1,20 +1,26 @@
 package privx
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	v1 "github.com/external-secrets/external-secrets/apis/meta/v1"
+	"github.com/go-logr/logr"
 	jwt "github.com/golang-jwt/jwt/v5"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +35,95 @@ var (
 	ErrUnsupportedPrivateKeyAlg = errors.New("unsupported private key algorithm")
 	ErrUnsupportedPEMBlockType  = errors.New("unsupported PEM block type")
 )
+
+var (
+	ErrPrivXTokenExchangeBuildRequest = errors.New("privx token exchange: build request")
+	ErrPrivXTokenExchangeDoRequest    = errors.New("privx token exchange: do request")
+	ErrPrivXTokenExchangeBadStatus    = errors.New("privx token exchange: bad http status")
+	ErrPrivXTokenExchangeReadBody     = errors.New("privx token exchange: read response body")
+	ErrPrivXTokenExchangeDecodeJSON   = errors.New("privx token exchange: decode json")
+)
+
+// ExchangeTokenRequest matches PrivX token exchange request fields.
+type ExchangeTokenRequest struct {
+	// Token to exchange to a PrivX access token
+	Token string `json:"token"`
+	// Access Token Scope
+	Scope string `json:"scope,omitempty"`
+	// OAUTH client ID
+	ClientID string `json:"client_id,omitempty"`
+}
+
+// TokenResponse is a common OAuth-style token response.
+// PrivX may return a subset/superset; unknown fields are ignored by encoding/json.
+type TokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	Scope        string `json:"scope,omitempty"`
+}
+
+// ExchangeToken exchanges an external JWT (e.g. Kubernetes SA token) to a PrivX access token.
+//
+// baseURL example: "https://privx.example.com"
+// If httpClient is nil, a default client with timeout is used.
+func ExchangeToken(
+	ctx context.Context,
+	httpClient *http.Client,
+	baseURL string,
+	reqBody ExchangeTokenRequest,
+) (TokenResponse, error) {
+	var out TokenResponse
+
+	baseURL = strings.TrimRight(baseURL, "/")
+	if reqBody.Token == "" {
+		// Keep it simple: server will also reject, but client-side guard is useful.
+		return out, fmt.Errorf("%w: empty token", ErrPrivXTokenExchangeBuildRequest)
+	}
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return out, fmt.Errorf("%w: marshal: %v", ErrPrivXTokenExchangeBuildRequest, err)
+	}
+
+	url := baseURL + "/auth/api/v1/token/login"
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return out, fmt.Errorf("%w: %v", ErrPrivXTokenExchangeBuildRequest, err)
+	}
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(r)
+	if err != nil {
+		return out, fmt.Errorf("%w: %v", ErrPrivXTokenExchangeDoRequest, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return out, fmt.Errorf("%w: %v", ErrPrivXTokenExchangeReadBody, err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Try to surface something useful without assuming PrivX error schema.
+		trimmed := strings.TrimSpace(string(respBody))
+		if len(trimmed) > 4000 {
+			trimmed = trimmed[:4000] + "…"
+		}
+		return out, fmt.Errorf("%w: status=%d body=%s", ErrPrivXTokenExchangeBadStatus, resp.StatusCode, trimmed)
+	}
+
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return out, fmt.Errorf("%w: %v; body=%s", ErrPrivXTokenExchangeDecodeJSON, err, strings.TrimSpace(string(respBody)))
+	}
+
+	return out, nil
+}
 
 // createSignedJWT creates a JWT signed with a private key read from a Kubernetes Secret.
 // It auto-detects the key algorithm from PEM and uses:
@@ -336,4 +431,30 @@ func detectJWTSigningKey(pemBytes []byte) (jwt.SigningMethod, any, error) {
 	default:
 		return nil, nil, fmt.Errorf("%w: %s", ErrUnsupportedPEMBlockType, block.Type)
 	}
+}
+
+var (
+	ErrTokenEmpty = errors.New("token debug: empty access token")
+)
+
+// LogOpaqueTokenResponse logs metadata of an OAuth token safely.
+// The access token itself is never logged. Instead, a short SHA256 fingerprint is logged.
+func logTokenResponse(logger logr.Logger, tr TokenResponse) error {
+	if tr.AccessToken == "" {
+		return ErrTokenEmpty
+	}
+
+	hash := sha256.Sum256([]byte(tr.AccessToken))
+	fingerprint := hex.EncodeToString(hash[:8]) // first 8 bytes only
+
+	logger.Info("oauth token response",
+		"tokenType", tr.TokenType,
+		"expiresIn", tr.ExpiresIn,
+		"scope", tr.Scope,
+		"hasRefreshToken", tr.RefreshToken != "",
+		"accessTokenLen", len(tr.AccessToken),
+		"accessTokenFingerprint", fingerprint,
+	)
+
+	return nil
 }

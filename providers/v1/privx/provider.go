@@ -186,15 +186,24 @@ func privxAuth(
 	if err != nil {
 		return nil, err
 	}
+
+	// Logging
 	decoded, err := decodeJWT(token)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidJWT, err)
 	}
-
 	logger := log.FromContext(ctx)
-	logger.Info("JWT payload", "claims", decoded)
+	logger.Info("JWT token", "claims", decoded)
 
-	return oauth.WithToken("Bearer " + token), nil
+	// Then exchange the token for a PrivX token
+	req := ExchangeTokenRequest{Token: token}
+	tokenResponse, err := ExchangeToken(ctx, nil, privxSpec.Host, req)
+	if err != nil {
+		return nil, err
+	}
+
+	err = logTokenResponse(logger, tokenResponse)
+	return oauth.WithToken("Bearer " + tokenResponse.AccessToken), nil
 }
 
 // privxAPI creates a working PrivX API connection from information in the Store specification.
